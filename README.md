@@ -13,7 +13,7 @@ Zero-dependency staggered scroll revelations using `IntersectionObserver` + `Web
 **No JavaScript animation loops. No layout thrashing. No dependencies. Just CSS-level performance with JS-level control.**
 
 ## 🎬 Live Demo (SmartObserver)
-https://codepen.io/Zahari-Shinikchiev/pen/OPRpJwm
+https://codepen.io/Zahari-Shinikchiev/debug/OPRpJwm
 
 ## Why This Library?
 
