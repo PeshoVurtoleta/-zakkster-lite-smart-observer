@@ -1,7 +1,7 @@
 {
   "name": "@zakkster/lite-smart-observer",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Zero-dependency staggered scroll revelations using IntersectionObserver + Web Animations API.",
   "type": "module",
   "main": "SmartObserver.js",
@@ -19,6 +19,15 @@
     "README.md"
   ],
   "license": "MIT",
+  "homepage": "https://github.com/PeshoVurtoleta/lite-smart-observer#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PeshoVurtoleta/lite-smart-observer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PeshoVurtoleta/lite-smart-observer/issues",
+    "email": "shinikchiev@yahoo.com"
+  },
   "keywords": [
     "intersection-observer",
     "scroll",
