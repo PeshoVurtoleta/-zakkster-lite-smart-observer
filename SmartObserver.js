@@ -6,17 +6,15 @@
  *
  * Features:
  * - IntersectionObserver + Web Animations API (no JS animation loops)
- * - Observation-order staggering (elements animate in the order they enter the viewport)
- * - Multiple animation modes: y, x, scale, fade, custom keyframes
- * - GSAP-style easing presets
- * - Optional re-entry animations (once: false)
- * - onEnter/onLeave lifecycle callbacks
- * - Zero dependencies, zero allocations per frame
+ * - Observation-order staggering across layout frames
+ * - 10 animation modes + GSAP-style easing presets
+ * - Safe WAAPI lifecycle: commitStyles() + cancel() on finish
+ * - Just-in-time willChange promotion (not on observe, on animate)
+ * - Clean re-entry (once: false) — no reverse(), full state reset
+ * - Zero dependencies
  */
 
-const DONE = Symbol('done');
-
-const EASINGS = {
+export const EASINGS = {
     "linear":      "linear",
     "ease":        "ease",
     "power1.out":  "cubic-bezier(0.17, 0.84, 0.44, 1)",
@@ -25,42 +23,41 @@ const EASINGS = {
     "power4.out":  "cubic-bezier(0.16, 1, 0.3, 1)",
     "expo.out":    "cubic-bezier(0.19, 1, 0.22, 1)",
     "back.out":    "cubic-bezier(0.34, 1.56, 0.64, 1)",
-    "elastic.out": "cubic-bezier(0.34, 1.56, 0.64, 1)",
 };
-
-export { EASINGS };
 
 export class SmartObserver {
     /**
      * @param {Object}   options
-     * @param {number}   [options.stagger=0.1]     Delay between batched elements (seconds)
-     * @param {number}   [options.duration=0.6]    Animation duration (seconds)
-     * @param {number}   [options.delay=0]         Initial delay (seconds)
-     * @param {boolean}  [options.once=true]       If false, re-animates on scroll back
-     * @param {number}   [options.threshold=0.15]  Intersection ratio to trigger
-     * @param {string}   [options.rootMargin="0px"] CSS margin around viewport
-     * @param {string}   [options.mode="y"]        "y", "x", "scale", "fade", "none", "custom"
-     * @param {string}   [options.ease="power2.out"] Easing preset key
-     * @param {number}   [options.y=40]            Starting Y offset (pixels)
-     * @param {number}   [options.x=40]            Starting X offset (pixels)
-     * @param {number}   [options.scale=0.8]       Starting scale
-     * @param {Array}    [options.keyframes]       Custom keyframes (mode: "custom")
-     * @param {Function} [options.onEnter]         Called when element enters
-     * @param {Function} [options.onLeave]         Called when element exits
+     * @param {number}   [options.stagger=0.1]             Delay between batched elements (seconds)
+     * @param {number}   [options.duration=0.6]            Animation duration (seconds)
+     * @param {number}   [options.delay=0]                 Initial delay (seconds)
+     * @param {boolean}  [options.once=true]                If false, re-animates on scroll back
+     * @param {number}   [options.threshold=0.15]           Intersection ratio to trigger
+     * @param {string}   [options.rootMargin="0px 0px -50px 0px"] Viewport margin
+     * @param {string}   [options.mode="y"]                 Animation mode
+     * @param {string}   [options.ease="power2.out"]        Easing preset key
+     * @param {number}   [options.y=40]                     Starting Y offset (pixels)
+     * @param {number}   [options.x=40]                     Starting X offset (pixels)
+     * @param {number}   [options.scale=0.8]                Starting scale
+     * @param {number}   [options.rotation=15]              Starting rotation (degrees)
+     * @param {Array}    [options.keyframes]                Custom WAAPI keyframes (mode: "custom")
+     * @param {Function} [options.onEnter]                  Called when element enters viewport
+     * @param {Function} [options.onLeave]                  Called when element exits viewport
      */
     constructor(options = {}) {
-        this._stagger   = (options.stagger || 0.1) * 1000;
-        this._duration  = (options.duration || 0.6) * 1000;
-        this._delay     = (options.delay || 0) * 1000;
-        this._once      = options.once !== undefined ? options.once : true;
-        this._threshold = options.threshold || 0.15;
-        this._rootMargin = options.rootMargin || "0px";
+        this._stagger    = (options.stagger || 0.1) * 1000;
+        this._duration   = (options.duration || 0.6) * 1000;
+        this._delay      = (options.delay || 0) * 1000;
+        this._once       = options.once !== undefined ? options.once : true;
+        this._threshold  = options.threshold || 0.15;
+        this._rootMargin = options.rootMargin || "0px 0px -50px 0px";
 
         this._mode         = options.mode || "y";
         this._customFrames = options.keyframes || null;
-        this._y     = options.y || 40;
-        this._x     = options.x || 40;
-        this._scale = options.scale !== undefined ? options.scale : 0.8;
+        this._y        = options.y || 40;
+        this._x        = options.x || 40;
+        this._scale    = options.scale !== undefined ? options.scale : 0.8;
+        this._rotation = options.rotation !== undefined ? options.rotation : 15;
 
         this._onEnter = options.onEnter || null;
         this._onLeave = options.onLeave || null;
@@ -74,8 +71,14 @@ export class SmartObserver {
             throw new Error("SmartObserver: 'custom' mode requires a valid keyframes array.");
         }
 
-        this._keyframes = this._buildKeyframes();
-        this._startTransform = this._keyframes[0].transform || "none";
+        // Pre-compute default keyframes for speed
+        this._defaultKeyframes = this._buildKeyframes(
+            this._mode, this._y, this._x, this._scale, this._rotation
+        );
+
+        // Stagger state — persistent counter bridges IO callbacks across layout frames
+        this._staggerCounter = 0;
+        this._staggerTimer = null;
 
         this._elements = new Map();
         this._destroyed = false;
@@ -86,53 +89,100 @@ export class SmartObserver {
         );
     }
 
-    /** @private */
-    _buildKeyframes() {
-        if (this._mode === "custom" && this._customFrames) return this._customFrames;
+    /** @private Build WAAPI keyframes for a given mode + parameters. */
+    _buildKeyframes(mode, y, x, scale, rot, transformOrigin = null) {
+        if (mode === "custom" && this._customFrames) return this._customFrames;
 
-        switch (this._mode) {
+        let frames;
+
+        switch (mode) {
             case "fade":
             case "none":
-                return [{ opacity: 0 }, { opacity: 1 }];
+                frames = [{ opacity: 0 }, { opacity: 1 }];
+                break;
+
             case "scale":
-                return [
-                    { opacity: 0, transform: `scale(${this._scale})` },
+                frames = [
+                    { opacity: 0, transform: `scale(${scale})` },
                     { opacity: 1, transform: "scale(1)" },
                 ];
+                break;
+
             case "x":
-                return [
-                    { opacity: 0, transform: `translate3d(${this._x}px, 0, 0)` },
+                frames = [
+                    { opacity: 0, transform: `translate3d(${x}px, 0, 0)` },
                     { opacity: 1, transform: "translate3d(0, 0, 0)" },
                 ];
+                break;
+
+            case "scaleUp":
+                frames = [
+                    { opacity: 0, transform: `translate3d(0, ${y}px, 0) scale(${scale})` },
+                    { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" },
+                ];
+                break;
+
+            case "rotateIn":
+                frames = [
+                    { opacity: 0, transform: `rotate(${rot}deg) scale(${scale})` },
+                    { opacity: 1, transform: "rotate(0deg) scale(1)" },
+                ];
+                break;
+
+            case "flipX":
+                frames = [
+                    { opacity: 0, transform: "perspective(600px) rotateX(90deg)" },
+                    { opacity: 1, transform: "perspective(600px) rotateX(0deg)" },
+                ];
+                break;
+
+            case "flipY":
+                frames = [
+                    { opacity: 0, transform: "perspective(600px) rotateY(90deg)" },
+                    { opacity: 1, transform: "perspective(600px) rotateY(0deg)" },
+                ];
+                break;
+
+            case "zoomBlur":
+                frames = [
+                    { opacity: 0, transform: `scale(${scale > 1 ? scale : 1.5})`, filter: "blur(8px)" },
+                    { opacity: 1, transform: "scale(1)", filter: "blur(0px)" },
+                ];
+                break;
+
             case "y":
             default:
-                return [
-                    { opacity: 0, transform: `translate3d(0, ${this._y}px, 0)` },
+                frames = [
+                    { opacity: 0, transform: `translate3d(0, ${y}px, 0)` },
                     { opacity: 1, transform: "translate3d(0, 0, 0)" },
                 ];
+                break;
         }
+
+        if (transformOrigin) frames[0].transformOrigin = transformOrigin;
+        return frames;
     }
 
     /**
      * Start observing elements for intersection.
-     * @param {string|NodeList|HTMLElement[]} selectorOrNodeList CSS selector or node list
+     * Accepts a CSS selector, NodeList, Array of elements, or a single element.
+     * @param {string|NodeList|HTMLElement[]|HTMLElement} selectorOrNodeList
      */
     observe(selectorOrNodeList) {
         if (this._destroyed) return;
 
         const nodes = typeof selectorOrNodeList === "string"
             ? document.querySelectorAll(selectorOrNodeList)
-            : selectorOrNodeList;
-
-        const willChangeVal = this._startTransform === "none" ? "opacity" : "opacity, transform";
+            : (selectorOrNodeList.length !== undefined
+                ? selectorOrNodeList
+                : [selectorOrNodeList]);
 
         for (const el of nodes) {
-            el.style.opacity = "0";
-            if (this._startTransform !== "none") {
-                el.style.transform = this._startTransform;
-            }
-            el.style.willChange = willChangeVal;
-
+            const mode = el.dataset.revealMode || this._mode;
+            // Pre-hide elements that will be WAAPI animated.
+            // willChange is set just-in-time in _handleIntersect, not here —
+            // avoids wasting compositor memory on off-screen elements.
+            if (mode !== "none") el.style.opacity = "0";
             this._elements.set(el, null);
             this._observer.observe(el);
         }
@@ -150,53 +200,117 @@ export class SmartObserver {
             else exited.push(e);
         }
 
-        // ── Exits ──
-        if (!this._once) {
-            for (const entry of exited) {
-                const el = entry.target;
-                const anim = this._elements.get(el);
+        // ── Entrances ──
+        for (const entry of entered) {
+            const el = entry.target;
+            const mode = el.dataset.revealMode || this._mode;
 
-                if (anim && anim !== DONE) {
-                    if (this._onLeave) this._onLeave(el);
-                    try { anim.reverse(); } catch { anim.cancel(); }
+            if (this._once) this._observer.unobserve(el);
+
+            // Cancel any in-flight animation (re-entry after partial exit)
+            const prev = this._elements.get(el);
+            if (prev && prev !== "DONE") {
+                prev.onfinish = null;
+                prev.cancel();
+            }
+
+            const delay = this._delay + (this._staggerCounter * this._stagger);
+            this._staggerCounter++;
+
+            // Fire lifecycle callback respecting stagger delay
+            if (this._onEnter) {
+                setTimeout(() => this._onEnter(el), delay);
+            }
+
+            if (mode !== "none") {
+                // Use cached default keyframes unless element has data-* overrides
+                let keyframes = this._defaultKeyframes;
+                const hasOverrides = el.dataset.revealY || el.dataset.revealX
+                    || el.dataset.revealScale || el.dataset.revealRotate
+                    || el.dataset.revealOrigin || el.dataset.revealMode;
+
+                if (hasOverrides) {
+                    keyframes = this._buildKeyframes(
+                        mode,
+                        Number(el.dataset.revealY ?? this._y),
+                        Number(el.dataset.revealX ?? this._x),
+                        Number(el.dataset.revealScale ?? this._scale),
+                        Number(el.dataset.revealRotate ?? this._rotation),
+                        el.dataset.revealOrigin || null,
+                    );
                 }
+
+                const rawDur = el.dataset.revealDuration;
+                const duration = rawDur !== undefined ? Number(rawDur) : this._duration;
+
+                // Just-in-time compositor promotion
+                el.style.willChange = mode === "zoomBlur"
+                    ? "opacity, transform, filter"
+                    : "opacity, transform";
+
+                const anim = el.animate(keyframes, {
+                    duration: Math.max(0, duration),
+                    delay,
+                    easing: this._ease,
+                    fill: "both", // Applies start state during delay — prevents flash
+                });
+
+                this._elements.set(el, anim);
+
+                anim.onfinish = () => {
+                    // Guard: ignore if this animation was cancelled/replaced
+                    if (this._elements.get(el) !== anim) return;
+
+                    // Bake final state into inline styles, then kill the animation.
+                    // This releases the WAAPI timeline so CSS hover transforms work.
+                    try { anim.commitStyles(); } catch (e) { /* Safari edge case */ }
+                    anim.cancel();
+                    this._elements.set(el, "DONE");
+                    el.style.willChange = "";
+                };
             }
         }
 
-        // ── Entrances ──
-        for (let i = 0; i < entered.length; i++) {
-            const entry = entered[i];
-            const el = entry.target;
-            const state = this._elements.get(el);
+        // Reset stagger counter after a gap between IO callback batches.
+        // max(50, stagger*0.75) bridges rapid-fire layout frames while
+        // resetting between distinct scroll gestures.
+        if (entered.length > 0) {
+            clearTimeout(this._staggerTimer);
+            this._staggerTimer = setTimeout(() => {
+                this._staggerCounter = 0;
+            }, Math.max(50, this._stagger * 0.75));
+        }
 
-            if (this._once && state === DONE) continue;
-            if (this._once) this._observer.unobserve(el);
+        // ── Exits (once: false only) ──
+        if (!this._once) {
+            for (const entry of exited) {
+                const el = entry.target;
+                const mode = el.dataset.revealMode || this._mode;
 
-            if (state && state !== DONE) state.cancel();
+                if (this._onLeave) this._onLeave(el);
 
-            if (this._onEnter) this._onEnter(el);
+                if (mode !== "none") {
+                    const anim = this._elements.get(el);
+                    if (anim && anim !== "DONE") {
+                        anim.onfinish = null;
+                        anim.cancel();
+                    }
 
-            const delay = this._delay + i * this._stagger;
+                    this._elements.set(el, null);
 
-            const anim = el.animate(this._keyframes, {
-                duration: this._duration,
-                delay,
-                easing: this._ease,
-                fill: "forwards",
-            });
-
-            anim.onfinish = () => {
-                // Clean up willChange to release compositor layer
-                el.style.willChange = "auto";
-                if (this._once) this._elements.set(el, DONE);
-            };
-
-            this._elements.set(el, anim);
+                    // Full state reset — clean slate for next intersection
+                    el.style.opacity = "0";
+                    el.style.transform = "";
+                    el.style.transformOrigin = "";
+                    el.style.filter = "";
+                    el.style.willChange = "";
+                }
+            }
         }
     }
 
     /**
-     * Disconnect observer, cancel animations, release references.
+     * Disconnect observer, cancel live animations, clean inline styles.
      * Idempotent.
      */
     destroy() {
@@ -208,9 +322,17 @@ export class SmartObserver {
             this._observer = null;
         }
 
+        clearTimeout(this._staggerTimer);
+
+        // Cancel any in-flight animations and clean up inline styles
         for (const [el, anim] of this._elements) {
-            if (anim && anim !== DONE) anim.cancel();
-            // Clean up inline styles
+            if (anim && anim !== "DONE") {
+                anim.onfinish = null;
+                anim.cancel();
+            }
+            el.style.opacity = "";
+            el.style.transform = "";
+            el.style.filter = "";
             el.style.willChange = "";
         }
 

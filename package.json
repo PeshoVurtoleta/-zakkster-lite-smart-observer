@@ -1,8 +1,8 @@
 {
   "name": "@zakkster/lite-smart-observer",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "version": "1.0.2",
-  "description": "Zero-dependency staggered scroll revelations using IntersectionObserver + Web Animations API.",
+  "version": "1.1.0",
+  "description": "Zero-dependency staggered scroll revelations using IntersectionObserver + Web Animations API. 10 animation modes.",
   "type": "module",
   "main": "SmartObserver.js",
   "types": "SmartObserver.d.ts",
@@ -25,7 +25,7 @@
     "url": "git+https://github.com/PeshoVurtoleta/lite-smart-observer.git"
   },
   "bugs": {
-    "url": "https://github.com/PeshoVurtoleta/lite-smart-observer/issues",
+    "url": "https://github.com/PeshoVurtoleta/lite-smartw-observer/issues",
     "email": "shinikchiev@yahoo.com"
   },
   "keywords": [
@@ -35,6 +35,9 @@
     "stagger",
     "reveal",
     "web-animations",
+    "waapi",
+    "flip",
+    "rotate",
     "zero-dependency"
   ]
 }
